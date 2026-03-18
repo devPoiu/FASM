@@ -1,0 +1,253 @@
+
+format PE GUI 4.0      ; Формат файла: Portable Executable (Windows), графическое приложение
+entry start            ; Точка входа в программу — метка 'start'
+
+include 'win32a.inc'   ; Подключаем описания функций Windows API (константы, структуры)
+
+; =========================================================================================================================
+
+
+section '.data' data readable writeable
+    _class      db 'ArkanoidClass',0  ; Имя класса окна (нужно для регистрации в Windows)
+    _title      db 'FASM Arkanoid',0  ; Текст в заголовке окна
+    
+    ; Мяч
+    ballX       dd 100    ; Текущая координата X мяча
+    ballY       dd 150    ; Текущая координата Y мяча
+    ballDX      dd 4      ; Скорость мяча по горизонтали (пикселей за тик)
+    ballDY      dd 4      ; Скорость мяча по вертикали
+    ballSize    dd 15     ; Диаметр мяча в пикселях
+
+    ; Ракетка
+    padX        dd 200    ; Позиция ракетки по X
+    padY        dd 260    ; Позиция ракетки по Y (фиксирована)
+    padW        dd 80     ; Ширина ракетки
+    padH        dd 12     ; Высота ракетки
+    
+    ; Блоки (константы для расчета сетки)
+    BRICK_ROWS    = 3     ; Количество рядов кирпичей
+    BRICK_COLS    = 6     ; Количество колонок
+    BRICK_WIDTH   = 70    ; Ширина одного кирпича
+    BRICK_HEIGHT  = 20    ; Высота одного кирпича
+    BRICK_GAP     = 5     ; Расстояние между кирпичами
+    bricks        db BRICK_ROWS * BRICK_COLS dup(1) ; Массив байтов: 1 - блок есть, 0 - разбит
+
+    msg         MSG       ; Структура для системных сообщений (нажатие кнопок и т.д.)
+    wc          WNDCLASS  ; Структура настроек окна
+    rect        RECT      ; Структура для координат области окна
+
+; =========================================================================================================================
+
+
+section '.code' code readable executable
+start:
+    invoke  GetModuleHandle, 0        ; Получаем ID запущенного процесса
+    mov     [wc.hInstance], eax       ; Сохраняем его в настройки окна
+    mov     [wc.lpfnWndProc], WindowProc ; Указываем функцию, которая будет рулить окном
+    mov     [wc.lpszClassName], _class   ; Привязываем имя класса
+    mov     [wc.hbrBackground], COLOR_WINDOW + 1 ; Цвет фона окна (белый)
+    invoke  RegisterClass, wc         ; Регистрируем класс в системе
+    
+    ; Создаем само окно
+    invoke  CreateWindowEx, 0, _class, _title, WS_VISIBLE + WS_SYSMENU,\
+            CW_USEDEFAULT, CW_USEDEFAULT, 480, 340, NULL, NULL, [wc.hInstance], NULL
+    
+    invoke  SetTimer, eax, 1, 16, NULL ; Включаем таймер: ID=1, срабатывает каждые 16мс (~60 FPS)
+
+msg_loop:                             ; Главный цикл обработки Windows-событий
+    invoke  GetMessage, msg, NULL, 0, 0 ; Ждем сообщение от системы
+    or      eax, eax                  ; Если вернулся 0 (WM_QUIT)...
+    jz      end_loop                  ; ...выходим из программы
+    invoke  TranslateMessage, msg     ; Преобразуем коды клавиш
+    invoke  DispatchMessage, msg      ; Отправляем сообщение в WindowProc
+    jmp     msg_loop                  ; Повторяем цикл
+
+end_loop:
+    invoke  ExitProcess, [msg.wParam] ; Завершаем работу программы
+
+
+; =========================================================================================================================
+
+
+proc WindowProc hwnd, wmsg, wparam, lparam
+    push    ebx esi edi               ; Сохраняем значения регистров (правило WinAPI)
+    
+    cmp     [wmsg], WM_KEYDOWN        ; Нажата клавиша?
+    je      .onkey
+    cmp     [wmsg], WM_TIMER          ; Сработал наш таймер (16мс)?
+    je      .ontimer
+    cmp     [wmsg], WM_PAINT          ; Нужно перерисовать экран?
+    je      .onpaint
+    cmp     [wmsg], WM_DESTROY        ; Окно закрыли?
+    je      .wmdestroy
+    
+    invoke  DefWindowProc, [hwnd], [wmsg], [wparam], [lparam] ; Стандартная обработка прочих событий
+    jmp     .finish
+
+.onkey:                               ; Обработка нажатий
+    mov     eax, [wparam]             ; Код нажатой клавиши в EAX
+    cmp     eax, VK_LEFT              ; Это "Стрелка влево"?
+    je      .moveLeft
+    cmp     eax, VK_RIGHT             ; Это "Стрелка вправо"?
+    je      .moveRight
+    jmp     .finish
+.moveLeft:
+    sub     [padX], 25                ; Сдвигаем ракетку влево на 25 пикс.
+    jmp     .finish
+.moveRight:
+    add     [padX], 25                ; Сдвигаем ракетку вправо на 25 пикс.
+    jmp     .finish
+
+.ontimer:                             ; Логика движения (каждые 16мс)
+    mov     eax, [ballDX]             ; Берем скорость X
+    add     [ballX], eax              ; Двигаем мяч по X
+    mov     eax, [ballDY]             ; Берем скорость Y
+    add     [ballY], eax              ; Двигаем мяч по Y
+    
+    invoke  GetClientRect, [hwnd], rect ; Узнаем текущий размер окна
+    
+    ; Отскоки от левой и правой стен
+    cmp     [ballX], 0                ; Ударились о левый край?
+    jle     .revX                     ; Если да — меняем направление X
+    mov     eax, [rect.right]
+    sub     eax, [ballSize]           ; Вычитаем размер мяча из ширины окна
+    cmp     [ballX], eax              ; Ударились о правый край?
+    jge     .revX                     ; Если да — меняем направление X
+
+    ; Отскок от потолка
+    cmp     [ballY], 0
+    jle     .revY                     ; Если Y <= 0, летим вниз
+    
+    ; Проигрыш
+    mov     eax, [rect.bottom]
+    cmp     [ballY], eax              ; Мяч упал за нижний край?
+    jge     .doReset                  ; Сброс игры
+
+    ; Столкновение с ракеткой (простая проверка прямоугольников)
+    mov     eax, [ballY]
+    add     eax, [ballSize]           ; Низ мяча
+    cmp     eax, [padY]               ; Долетел до высоты ракетки?
+    jl      .checkBricks              ; Если выше — идем проверять кирпичи
+    mov     ebx, [padY]
+    add     ebx, [padH]
+    cmp     eax, ebx                  ; Если ниже дна ракетки — не считаем
+    jg      .checkBricks
+    mov     eax, [ballX]              ; Центр мяча по X
+    cmp     eax, [padX]               ; Он правее левого края ракетки?
+    jl      .checkBricks
+    mov     ebx, [padX]
+    add     ebx, [padW]               ; И левее правого края?
+    cmp     eax, ebx
+    jg      .checkBricks
+    neg     [ballDY]                  ; Отбиваем вверх!
+    jmp     .redraw
+
+.checkBricks:                         ; Проверка столкновения с блоками
+    xor     ecx, ecx                  ; Индекс кирпича в массиве (0, 1, 2...)
+    xor     ebx, ebx                  ; Счетчик "живых" блоков
+.brickLoop:
+    cmp     byte [bricks + ecx], 0    ; Блок уже разбит?
+    je      .nextBrick
+    
+    inc     ebx                       ; Плюс один к живым блокам
+    
+    ; Математика: вычисляем координаты кирпича на экране по его индексу
+    push    ecx ebx
+    xor     edx, edx
+    mov     eax, ecx
+    mov     esi, BRICK_COLS
+    div     esi                       ; EAX = строка, EDX = столбец
+    imul    edx, BRICK_WIDTH + BRICK_GAP
+    add     edx, 20                   ; EDX = координата X кирпича
+    imul    eax, BRICK_HEIGHT + BRICK_GAP
+    add     eax, 20                   ; EAX = координата Y кирпича
+    
+    ; Проверка попадания мяча в этот кирпич
+    mov     esi, [ballX]
+    cmp     esi, edx                  ; Мяч левее кирпича?
+    jl      .popNext
+    add     edx, BRICK_WIDTH
+    cmp     esi, edx                  ; Мяч правее кирпича?
+    jg      .popNext
+    mov     edi, [ballY]
+    cmp     edi, eax                  ; Мяч выше кирпича?
+    jl      .popNext
+    add     eax, BRICK_HEIGHT
+    cmp     edi, eax                  ; Мяч ниже кирпича?
+    jg      .popNext
+    
+    ; ПОПАЛИ!
+    pop     ebx ecx
+    mov     byte [bricks + ecx], 0    ; Уничтожаем блок
+    neg     [ballDY]                  ; Мяч отскакивает
+    dec     ebx                       ; Убираем один из счетчика живых
+    jmp     .afterBrickLoop           ; Выходим из цикла (одно попадание за раз)
+
+.popNext:
+    pop     ebx ecx
+.nextBrick:
+    inc     ecx                       ; Переходим к следующему кирпичу
+    cmp     ecx, BRICK_ROWS * BRICK_COLS
+    jl      .brickLoop
+
+.afterBrickLoop:
+    test    ebx, ebx                  ; Если живых блоков 0...
+    jz      .doReset                  ; ...перезапуск (победа)
+    jmp     .redraw
+
+.doReset:
+    stdcall ResetGame                 ; Сбрасываем координаты и блоки
+    jmp     .redraw
+
+.revX: neg [ballDX] \ jmp .redraw     ; Разворот по X
+.revY: neg [ballDY] \ jmp .redraw     ; Разворот по Y
+
+.redraw:
+    invoke  InvalidateRect, [hwnd], NULL, TRUE ; Говорим Windows: "Экран устарел, перерисуй его"
+    jmp     .finish
+
+.onpaint:                             ; Рисование графики
+    locals
+        ps PAINTSTRUCT
+    endl
+    lea     eax, [ps]
+    invoke  BeginPaint, [hwnd], eax   ; Начинаем рисовать
+    mov     ebx, eax                  ; EBX = контекст рисования (HDC)
+    
+    ; Рисуем блоки циклом
+    invoke  CreateSolidBrush, 0x004040FF ; Создаем красный цвет
+    invoke  SelectObject, ebx, eax    ; Выбираем его для рисования
+    push    eax                       ; Сохраняем старую кисть
+    xor     ecx, ecx
+.drawBricks:
+    cmp     byte [bricks + ecx], 1    ; Если блок жив...
+    jne     .skipDraw
+    ; (Тут снова расчет координат X/Y для рисования прямоугольника)
+    invoke  Rectangle, ebx, edx, eax, edi, esi ; Рисуем кирпич
+.skipDraw:
+    inc     ecx
+    cmp     ecx, BRICK_ROWS * BRICK_COLS
+    jl      .drawBricks
+    pop     eax
+    invoke  SelectObject, ebx, eax    ; Возвращаем старую кисть
+    invoke  DeleteObject, eax         ; Удаляем красную кисть из памяти
+
+    ; Рисуем мяч (голубой эллипс)
+    ; ... аналогично создается кисть, вызывается Ellipse, затем удаление ...
+
+    ; Рисуем ракетку (черный прямоугольник)
+    ; ... аналогично Rectangle ...
+    
+    lea     eax, [ps]
+    invoke  EndPaint, [hwnd], eax     ; Завершаем рисование
+    jmp     .finish
+
+.wmdestroy:
+    invoke  KillTimer, [hwnd], 1      ; Выключаем таймер
+    invoke  PostQuitMessage, 0        ; Посылаем сигнал закрытия программы
+    xor     eax, eax
+
+.finish:
+    pop     edi esi ebx               ; Восстанавливаем регистры
+    ret
+endp
